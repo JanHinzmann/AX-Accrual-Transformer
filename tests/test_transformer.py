@@ -115,11 +115,11 @@ def test_positive_and_negative_values_populate_correct_sides(tmp_path):
     )
     _, _, rows, _ = parse_generated(result, 120)
 
-    assert rows[0]["Soll"] == "125.5"
+    assert rows[0]["Soll"] == "125,50"
     assert rows[0]["Haben"] == ""
     assert rows[0]["Gegenkonto"] == "307030000"
     assert rows[1]["Soll"] == ""
-    assert rows[1]["Haben"] == "48.25"
+    assert rows[1]["Haben"] == "48,25"
     assert rows[1]["Gegenkonto"] == "130010010"
 
 
@@ -137,17 +137,23 @@ def test_posting_text_numeric_parsing_and_identifiers(tmp_path):
     _, _, rows, _ = parse_generated(result, 120)
 
     assert rows[0]["Buchungstext"] == "08.2026 RUECK Vendor GmbH Service , 0007"
-    assert rows[0]["Soll"] == "1234.56"
+    assert rows[0]["Soll"] == "1234,56"
     assert rows[0]["Konto"] == "681200000"
 
 
 @pytest.mark.parametrize("month", [None, "", "   ", float("nan")])
-def test_blank_month_copies_posting_description_verbatim(tmp_path, month):
-    row = source_row(**{"Month": month, "Posting description": "  Audit fee  "})
+def test_blank_month_builds_posting_description_and_vendor_id(tmp_path, month):
+    row = source_row(
+        **{
+            "Month": month,
+            "Posting description": "Audit fee",
+            "Vendor ID": "0007",
+        }
+    )
     result = run_process(tmp_path, [row], [(120, "AX")])
     _, _, rows, _ = parse_generated(result, 120)
 
-    assert rows[0]["Buchungstext"] == "  Audit fee  "
+    assert rows[0]["Buchungstext"] == "Audit fee , 0007"
 
 
 @pytest.mark.parametrize(
@@ -183,6 +189,25 @@ def test_posting_text_omits_missing_optional_values(tmp_path):
     assert posting_text.startswith("04.2026 RUECK")
     assert "nan" not in posting_text.casefold()
     assert "none" not in posting_text.casefold()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (125, "125,00"),
+        (125.5, "125,50"),
+        ("125.554", "125,55"),
+        ("125.555", "125,56"),
+    ],
+)
+def test_csv_amounts_use_decimal_comma_two_places_and_half_up_rounding(
+    tmp_path, value, expected
+):
+    result = run_process(tmp_path, [source_row(value=value)], [(120, "AX")])
+    _, _, rows, _ = parse_generated(result, 120)
+
+    assert rows[0]["Soll"] == expected
+    assert rows[0]["Haben"] == ""
 
 
 def test_split_files_are_csv_and_index_restarts_for_each_company(tmp_path):
@@ -342,4 +367,8 @@ def test_comma_delimiter_quotes_commas_and_round_trips(tmp_path):
 
     assert headers == list(AX_HEADERS)
     assert rows[0]["Buchungstext"] == "08.2026 RUECK Vendor, Inc. Consulting fee , V-007"
+    assert rows[0]["Soll"] == "100,00"
     assert '"08.2026 RUECK Vendor, Inc. Consulting fee , V-007"' in text
+    assert '"100,00"' in text
+    parsed = list(csv.reader(io.StringIO(text, newline=""), delimiter=","))
+    assert all(len(record) == len(headers) for record in parsed)

@@ -7,7 +7,7 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import BinaryIO, Iterable
 from zoneinfo import ZoneInfo
@@ -48,6 +48,9 @@ AX_HEADERS = (
     "Rückbuchung (ja/nein)",
     "Rückbuchungsdatum",
 )
+
+AX_AMOUNT_HEADERS = frozenset({"Soll", "Haben"})
+TWO_DECIMAL_PLACES = Decimal("0.01")
 
 MAPPING_COLUMNS = ("Company ID", "ERP System")
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -308,14 +311,15 @@ def _read_source(uploaded: bytes | BinaryIO) -> tuple[str, int, list[_SourceRow]
 
 def _build_posting_text(row: _SourceRow) -> str:
     month = _identifier_text(row.values["Month"], row.number_formats["Month"])
+    vendor_id = _identifier_text(row.values["Vendor ID"], row.number_formats["Vendor ID"])
     if not month:
-        return _copy_text(row.values["Posting description"])
+        posting_description = _copy_text(row.values["Posting description"])
+        return f"{posting_description} , {vendor_id}"
     if re.fullmatch(r"[1-9]", month):
         month = month.zfill(2)
 
     vendor_name = _clean_text(row.values["Vendor name"])
     posting_description = _clean_text(row.values["Posting description"])
-    vendor_id = _identifier_text(row.values["Vendor ID"], row.number_formats["Vendor ID"])
     return f"{month}.2026 RUECK {vendor_name} {posting_description} , {vendor_id}".strip()
 
 
@@ -400,6 +404,14 @@ def _format_csv_value(value: object) -> str:
     return str(value)
 
 
+def _format_csv_amount(value: object) -> str:
+    if value is None:
+        return ""
+    decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
+    rounded = decimal_value.quantize(TWO_DECIMAL_PLACES, rounding=ROUND_HALF_UP)
+    return format(rounded, ".2f").replace(".", ",")
+
+
 def _write_ax_csv(
     rows: list[_SourceRow],
     parsed_values: dict[int, Decimal],
@@ -453,7 +465,14 @@ def _write_ax_csv(
             "Rückbuchung (ja/nein)": "ja",
             "Rückbuchungsdatum": reversal_date,
         }
-        writer.writerow([_format_csv_value(row_values[header]) for header in headers])
+        writer.writerow(
+            [
+                _format_csv_amount(row_values[header])
+                if header in AX_AMOUNT_HEADERS
+                else _format_csv_value(row_values[header])
+                for header in headers
+            ]
+        )
 
     return output.getvalue().encode("utf-8-sig")
 
