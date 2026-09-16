@@ -21,7 +21,7 @@ SOURCE_HEADERS = [
     "Vendor ID",
     "Vendor name",
     "Posting description",
-    "Month",
+    "Time",
     "Value",
 ]
 
@@ -35,7 +35,7 @@ def source_row(company_id=120, value=100, **overrides):
         "Vendor ID": "V-007",
         "Vendor name": "Example Vendor",
         "Posting description": "Consulting fee",
-        "Month": 8,
+        "Time": 8,
         "Value": value,
     }
     values.update(overrides)
@@ -52,6 +52,21 @@ def workbook_bytes(rows, *, headers=SOURCE_HEADERS, header_row=1):
         worksheet.cell(header_row, column_index, header)
     for row in rows:
         worksheet.append([row.get(header) if isinstance(row, dict) else None for header in headers])
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def write_source_sheet(worksheet, rows, *, headers=SOURCE_HEADERS, header_row=1):
+    for row_index in range(1, header_row):
+        worksheet.cell(row_index, 1, "Accrual upload")
+    for column_index, header in enumerate(headers, start=1):
+        worksheet.cell(header_row, column_index, header)
+    for row in rows:
+        worksheet.append([row.get(header) if isinstance(row, dict) else None for header in headers])
+
+
+def save_workbook_bytes(workbook):
     output = io.BytesIO()
     workbook.save(output)
     return output.getvalue()
@@ -84,12 +99,13 @@ def run_process(
     template=None,
     name="source.xlsx",
     header_row=1,
+    headers=SOURCE_HEADERS,
     delimiter=";",
 ):
     mapping_path = write_mapping(tmp_path / "mapping.xlsx", mappings)
     template_path = template or write_blank_template(tmp_path / "template.xlsx")
     return process_accrual_workbook(
-        workbook_bytes(rows, header_row=header_row),
+        workbook_bytes(rows, headers=headers, header_row=header_row),
         original_filename=name,
         company_mapping_path=mapping_path,
         ax_template_path=template_path,
@@ -105,6 +121,27 @@ def parse_generated(result, company_id, *, delimiter=";"):
     headers = parsed[0]
     rows = [dict(zip(headers, row)) for row in parsed[1:]]
     return generated, headers, rows, text
+
+
+def run_process_bytes(
+    tmp_path: Path,
+    uploaded,
+    mappings,
+    *,
+    template=None,
+    name="source.xlsx",
+    delimiter=";",
+):
+    mapping_path = write_mapping(tmp_path / "mapping.xlsx", mappings)
+    template_path = template or write_blank_template(tmp_path / "template.xlsx")
+    return process_accrual_workbook(
+        uploaded,
+        original_filename=name,
+        company_mapping_path=mapping_path,
+        ax_template_path=template_path,
+        processing_date=date(2026, 9, 16),
+        csv_delimiter=delimiter,
+    )
 
 
 def test_positive_and_negative_values_populate_correct_sides(tmp_path):
@@ -127,7 +164,7 @@ def test_posting_text_numeric_parsing_and_identifiers(tmp_path):
     row = source_row(
         value="1.234,56",
         **{
-            "Month": " 08 ",
+            "Time": " 08 ",
             "Vendor name": " Vendor GmbH ",
             "Posting description": " Service ",
             "Vendor ID": "0007",
@@ -141,11 +178,11 @@ def test_posting_text_numeric_parsing_and_identifiers(tmp_path):
     assert rows[0]["Konto"] == "681200000"
 
 
-@pytest.mark.parametrize("month", [None, "", "   ", float("nan")])
-def test_blank_month_builds_posting_description_and_vendor_id(tmp_path, month):
+@pytest.mark.parametrize("time_value", [None, "", "   ", float("nan")])
+def test_blank_time_builds_posting_description_and_vendor_id(tmp_path, time_value):
     row = source_row(
         **{
-            "Month": month,
+            "Time": time_value,
             "Posting description": "Audit fee",
             "Vendor ID": "0007",
         }
@@ -157,7 +194,7 @@ def test_blank_month_builds_posting_description_and_vendor_id(tmp_path, month):
 
 
 @pytest.mark.parametrize(
-    ("month", "expected_prefix"),
+    ("time_value", "expected_prefix"),
     [
         (1, "01.2026 RUECK"),
         ("7", "07.2026 RUECK"),
@@ -166,8 +203,8 @@ def test_blank_month_builds_posting_description_and_vendor_id(tmp_path, month):
         (12, "12.2026 RUECK"),
     ],
 )
-def test_posting_text_formats_month_without_double_padding(tmp_path, month, expected_prefix):
-    result = run_process(tmp_path, [source_row(**{"Month": month})], [(120, "AX")])
+def test_posting_text_formats_time_without_double_padding(tmp_path, time_value, expected_prefix):
+    result = run_process(tmp_path, [source_row(**{"Time": time_value})], [(120, "AX")])
     _, _, rows, _ = parse_generated(result, 120)
 
     assert rows[0]["Buchungstext"].startswith(expected_prefix)
@@ -176,7 +213,7 @@ def test_posting_text_formats_month_without_double_padding(tmp_path, month, expe
 def test_posting_text_omits_missing_optional_values(tmp_path):
     row = source_row(
         **{
-            "Month": 4,
+            "Time": 4,
             "Vendor name": None,
             "Posting description": "Audit fee",
             "Vendor ID": None,
@@ -323,6 +360,140 @@ def test_headers_can_be_detected_below_first_row(tmp_path):
     assert result.source_sheet == "DATA"
     assert result.source_header_row == 3
     assert len(result.files) == 1
+
+
+def test_extra_tabs_are_ignored_and_trimmed_data_name_is_detected(tmp_path):
+    workbook = Workbook()
+    cover = workbook.active
+    cover.title = "Cover"
+    cover.append(["Company ID", "Company ID", "Notes"])
+    data = workbook.create_sheet(" DATA ")
+    write_source_sheet(data, [source_row(**{"Time": 3})], header_row=3)
+    notes = workbook.create_sheet("Notes")
+    notes.append(["Time", "Unrelated content"])
+
+    result = run_process_bytes(
+        tmp_path,
+        save_workbook_bytes(workbook),
+        [(120, "AX")],
+    )
+    _, _, rows, _ = parse_generated(result, 120)
+
+    assert result.source_sheet == " DATA "
+    assert result.source_header_row == 3
+    assert rows[0]["Buchungstext"].startswith("03.2026 RUECK")
+
+
+def test_valid_data_sheet_is_preferred_over_an_earlier_valid_sheet(tmp_path):
+    workbook = Workbook()
+    archive = workbook.active
+    archive.title = "Archive"
+    write_source_sheet(archive, [source_row(**{"Time": 11})])
+    data = workbook.create_sheet("data")
+    write_source_sheet(data, [source_row(**{"Time": 3})])
+
+    result = run_process_bytes(
+        tmp_path,
+        save_workbook_bytes(workbook),
+        [(120, "AX")],
+    )
+    _, _, rows, _ = parse_generated(result, 120)
+
+    assert result.source_sheet == "data"
+    assert result.source_row_count == 1
+    assert rows[0]["Buchungstext"].startswith("03.2026 RUECK")
+
+
+def test_first_valid_sheet_is_used_when_there_is_no_data_sheet(tmp_path):
+    workbook = Workbook()
+    cover = workbook.active
+    cover.title = "Cover"
+    cover.append(["Instructions only"])
+    current = workbook.create_sheet("Current accruals")
+    write_source_sheet(current, [source_row(**{"Time": 6})])
+    archive = workbook.create_sheet("Archive")
+    write_source_sheet(archive, [source_row(**{"Time": 12})])
+
+    result = run_process_bytes(
+        tmp_path,
+        save_workbook_bytes(workbook),
+        [(120, "AX")],
+    )
+    _, _, rows, _ = parse_generated(result, 120)
+
+    assert result.source_sheet == "Current accruals"
+    assert rows[0]["Buchungstext"].startswith("06.2026 RUECK")
+
+
+def test_extra_columns_and_old_month_are_ignored(tmp_path):
+    headers = [
+        "Extra Before",
+        "Time",
+        "Company ID",
+        "Cost center ID",
+        "Extra Between",
+        "Ledger account ID",
+        "Project ID",
+        "Vendor ID",
+        "Vendor name",
+        "Posting description",
+        "Month",
+        "Value",
+        "Extra After",
+    ]
+    row = source_row(**{"Time": 3})
+    row.update(
+        {
+            "Month": 12,
+            "Extra Before": "ignore me",
+            "Extra Between": "ignore me too",
+            "Extra After": 999,
+        }
+    )
+    irrelevant_only_row = {
+        "Extra Before": "not a source row",
+        "Month": 10,
+        "Extra After": "still irrelevant",
+    }
+
+    result = run_process(
+        tmp_path,
+        [row, irrelevant_only_row],
+        [(120, "AX")],
+        headers=headers,
+    )
+    _, generated_headers, rows, _ = parse_generated(result, 120)
+
+    assert result.source_row_count == 1
+    assert generated_headers == list(AX_HEADERS)
+    assert rows[0]["Buchungstext"].startswith("03.2026 RUECK")
+    assert not {"Extra Before", "Extra Between", "Month", "Extra After"} & set(
+        generated_headers
+    )
+
+
+def test_month_only_source_fails_with_missing_time_error(tmp_path):
+    headers = ["Month" if header == "Time" else header for header in SOURCE_HEADERS]
+    row = source_row()
+    row["Month"] = row.pop("Time")
+
+    with pytest.raises(WorkbookValidationError) as exc_info:
+        run_process(tmp_path, [row], [(120, "AX")], headers=headers)
+
+    message = str(exc_info.value)
+    assert "Missing required columns: Time" in message
+    assert "Expected:" in message
+
+
+def test_duplicate_required_header_on_selected_source_row_fails(tmp_path):
+    headers = [*SOURCE_HEADERS, "Time"]
+
+    with pytest.raises(WorkbookValidationError) as exc_info:
+        run_process(tmp_path, [source_row()], [(120, "AX")], headers=headers)
+
+    message = str(exc_info.value)
+    assert "header 'Time' more than once" in message
+    assert "sheet 'DATA'" in message
 
 
 def test_missing_required_source_column_has_clear_error(tmp_path):

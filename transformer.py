@@ -20,7 +20,7 @@ REQUIRED_SOURCE_COLUMNS = (
     "Ledger account ID",
     "Cost center ID",
     "Value",
-    "Month",
+    "Time",
     "Vendor name",
     "Posting description",
     "Vendor ID",
@@ -249,6 +249,74 @@ def _locate_header(
     )
 
 
+def _locate_source_header(workbook) -> tuple[object, int, dict[str, int]]:
+    required = REQUIRED_SOURCE_COLUMNS
+    normalized_required = {_normalize_header(name): name for name in required}
+    preferred = [
+        worksheet
+        for worksheet in workbook.worksheets
+        if worksheet.title.strip().casefold() == "data"
+    ]
+    remaining = [worksheet for worksheet in workbook.worksheets if worksheet not in preferred]
+    detected_samples: list[str] = []
+    best_missing = list(required)
+    best_match_count = -1
+
+    for worksheet in preferred + remaining:
+        max_scan_row = min(max(worksheet.max_row, 1), 50)
+        max_scan_col = max(worksheet.max_column, 1)
+        for row_index in range(1, max_scan_row + 1):
+            found: dict[str, list[int]] = {}
+            displayed: list[str] = []
+            for column_index in range(1, max_scan_col + 1):
+                value = worksheet.cell(row_index, column_index).value
+                normalized = _normalize_header(value)
+                if normalized:
+                    displayed.append(_clean_text(value))
+                    if normalized in normalized_required:
+                        found.setdefault(normalized, []).append(column_index)
+
+            if displayed and len(detected_samples) < 5:
+                detected_samples.append(f"{worksheet.title}!{row_index}: {', '.join(displayed)}")
+
+            match_count = sum(normalized in found for normalized in normalized_required)
+            if match_count > best_match_count:
+                best_match_count = match_count
+                best_missing = [
+                    name
+                    for normalized, name in normalized_required.items()
+                    if normalized not in found
+                ]
+
+            if match_count != len(required):
+                continue
+
+            duplicate = next(
+                (normalized for normalized, columns in found.items() if len(columns) > 1),
+                None,
+            )
+            if duplicate is not None:
+                raise WorkbookValidationError(
+                    "The uploaded accrual workbook contains the header "
+                    f"'{normalized_required[duplicate]}' more than once on sheet "
+                    f"'{worksheet.title}', row {row_index}."
+                )
+            return (
+                worksheet,
+                row_index,
+                {name: found[normalized][0] for normalized, name in normalized_required.items()},
+            )
+
+    missing = ", ".join(best_missing)
+    expected = ", ".join(required)
+    detected = "; ".join(detected_samples) if detected_samples else "no populated header candidates"
+    raise WorkbookValidationError(
+        "Could not find a source worksheet with all required columns in the uploaded accrual "
+        f"workbook. Missing required columns: {missing}. Expected: {expected}. "
+        f"Detected: {detected}."
+    )
+
+
 def _load_company_mapping(mapping_path: Path) -> dict[str, set[str]]:
     try:
         workbook = load_workbook(mapping_path, data_only=True, read_only=False)
@@ -282,9 +350,7 @@ def _read_source(uploaded: bytes | BinaryIO) -> tuple[str, int, list[_SourceRow]
             f"Technical detail: {exc}"
         ) from exc
 
-    worksheet, header_row, columns = _locate_header(
-        workbook, REQUIRED_SOURCE_COLUMNS, workbook_label="the uploaded accrual workbook"
-    )
+    worksheet, header_row, columns = _locate_source_header(workbook)
     rows: list[_SourceRow] = []
     issues: list[RowIssue] = []
     for row_index in range(header_row + 1, worksheet.max_row + 1):
@@ -310,17 +376,17 @@ def _read_source(uploaded: bytes | BinaryIO) -> tuple[str, int, list[_SourceRow]
 
 
 def _build_posting_text(row: _SourceRow) -> str:
-    month = _identifier_text(row.values["Month"], row.number_formats["Month"])
+    time_value = _identifier_text(row.values["Time"], row.number_formats["Time"])
     vendor_id = _identifier_text(row.values["Vendor ID"], row.number_formats["Vendor ID"])
-    if not month:
+    if not time_value:
         posting_description = _copy_text(row.values["Posting description"])
         return f"{posting_description} , {vendor_id}"
-    if re.fullmatch(r"[1-9]", month):
-        month = month.zfill(2)
+    if re.fullmatch(r"[1-9]", time_value):
+        time_value = time_value.zfill(2)
 
     vendor_name = _clean_text(row.values["Vendor name"])
     posting_description = _clean_text(row.values["Posting description"])
-    return f"{month}.2026 RUECK {vendor_name} {posting_description} , {vendor_id}".strip()
+    return f"{time_value}.2026 RUECK {vendor_name} {posting_description} , {vendor_id}".strip()
 
 
 def _validate_ax_rows(rows: list[_SourceRow]) -> tuple[dict[int, Decimal], list[RowIssue]]:
@@ -360,7 +426,7 @@ def _validate_ax_rows(rows: list[_SourceRow]) -> tuple[dict[int, Decimal], list[
                     row.company_id,
                     row.row_number,
                     "Buchungstext",
-                    "Buchungstext is empty; Posting description is required when Month is empty.",
+                    "Buchungstext is empty; Posting description is required when Time is empty.",
                 )
             )
     return parsed_values, issues
